@@ -1,0 +1,6 @@
+ccxt
+pandas
+numpy
+bingx
+supabase
+python-dotenv

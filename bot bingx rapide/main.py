@@ -1,0 +1,179 @@
+# main.py
+
+import time
+import traceback
+import os
+from dotenv import load_dotenv
+
+from strategy import SmartEntryStrategy
+from my_bingx_api import BingxClient
+from indicators import Indicators
+from config import config
+from data_feed import fetch_ohlcv
+from log_manager import log_info, log_error
+from memory import initialize_recent_wins
+from ai_module import get_adjust_factor
+
+# === CHARGEMENT DES CLÉS API ===
+load_dotenv()
+API_KEY = os.getenv("BINGX_API_KEY")
+API_SECRET = os.getenv("BINGX_API_SECRET")
+
+# Vérification
+if not API_KEY or not API_SECRET:
+    raise ValueError("❌ Les clés API BingX sont manquantes dans le fichier .env.")
+
+# === INITIALISATION DU FICHIER DE MÉMOIRE ===
+initialize_recent_wins()
+
+# === INITIALISATION STRATÉGIE ===
+config['initial_equity'] = 120
+symbol = config['symbol']
+strategy = SmartEntryStrategy(API_KEY, API_SECRET)
+bingx = BingxClient(API_KEY, API_SECRET)
+
+# === PARAMÈTRES ===
+M3_INTERVAL = 180
+last_m3_refresh = 0
+latest_candle = None
+
+# === TRAILING STATE ===
+in_position = False
+entry_price = None
+side = None
+trailing_stop = None
+trailing_offset = None
+trailing_sl = None
+
+def run_bot():
+    global last_m3_refresh, latest_candle
+    global in_position, entry_price, side, trailing_stop, trailing_offset, trailing_sl
+
+    log_info("🚀 Bot lancé avec trailing stop manuel actif")
+
+    while True:
+        try:
+            now = time.time()
+
+            # === 1. Vérifie TP/SL avec le système de la stratégie ===
+            if strategy.pm.entry_time is not None:
+                log_info("🔄 Vérification TP/SL...")
+                try:
+                    current_price = bingx.get_entry_price(symbol)
+                    balance_info = strategy.api.get_balance()
+                    equity = float(balance_info["equity"])
+                    qty = strategy.risk.calculate_qty(equity)
+
+                    strategy.pm.check_exit_conditions(
+                        entry_price=current_price,
+                        tp=strategy.pm.tp_target,
+                        sl=strategy.pm.sl_target,
+                        side=strategy.pm.current_side,
+                        qty=qty
+                    )
+                except Exception as e:
+                    log_error(f"Erreur TP/SL : {e}")
+
+            # === 2. Gestion du trailing stop manuel toutes les secondes ===
+            if in_position and trailing_stop is not None and trailing_offset is not None:
+                try:
+                    current_price = bingx.get_entry_price(symbol)
+
+                    if latest_candle:
+                        high = [c["high"] for c in latest_candle]
+                        low = [c["low"] for c in latest_candle]
+                        close = [c["close"] for c in latest_candle]
+                        atr = strategy.indicators.atr(high, low, close, 14)[-1]
+                    else:
+                        log_error("⛔ Impossible de calculer ATR : données absentes.")
+                        atr = 0.5
+
+                    new_sl = strategy.risk.manage_trailing_stop(
+                        side=side,
+                        entry_price=entry_price,
+                        current_price=current_price,
+                        current_sl=trailing_sl,
+                        atr=atr
+                    )
+
+                    if new_sl != trailing_sl:
+                        trailing_sl = new_sl
+                        log_info(f"[TRAIL] 🧠 SL mis à jour automatiquement : {trailing_sl:.2f}")
+
+                    if (side == "BUY" and current_price < trailing_sl) or (side == "SELL" and current_price > trailing_sl):
+                        log_info(f"[TRAIL] 💥 Stop touché. Fermeture à {current_price}")
+                        bingx.close_market_order(symbol, side)
+                        in_position = False
+                        trailing_sl = None
+
+                except Exception as e:
+                    log_error(f"Erreur trailing stop : {e}")
+
+            # === 3. Récupère les bougies toutes les 3 minutes ===
+            if now - last_m3_refresh > M3_INTERVAL:
+                log_info("📡 Récupération des bougies M3...")
+                candles = fetch_ohlcv(symbol.replace("-", "/"), timeframe="3m", limit=150)
+
+                if candles:
+                    formatted = [{
+                        "timestamp": c[0],
+                        "open": c[1],
+                        "high": c[2],
+                        "low": c[3],
+                        "close": c[4],
+                        "volume": c[5]
+                    } for c in candles]
+
+                    latest_candle = formatted
+                    last_m3_refresh = now
+                    log_info("✅ Bougies M3 mises à jour")
+                else:
+                    log_info("⚠️ Impossible de récupérer les bougies")
+
+            # === 4. Analyse toutes les secondes si pas de position ===
+            if strategy.pm.entry_time is None and not in_position and latest_candle:
+                log_info("🔍 Analyse en cours du marché...")
+                try:
+                    live_price = bingx.get_entry_price(symbol)
+                    modified = latest_candle.copy()
+                    modified[-1]["close"] = live_price
+
+                    adjust_factor = get_adjust_factor()
+                    log_info(f"📊 Facteur d’ajustement IA calculé : {adjust_factor}")
+
+                    signal = strategy.on_new_candle(modified)
+
+                    if signal and signal.get("side") and signal.get("qty"):
+                        log_info(f"🟢 Signal détecté : {signal}")
+
+                        signal["tp"] *= adjust_factor
+                        signal["sl"] *= adjust_factor
+
+                        bingx.place_order_with_protection(
+                            symbol=symbol,
+                            side=signal["side"],
+                            quantity=signal["qty"],
+                            tp=signal.get("tp"),
+                            sl=signal.get("sl"),
+                            trailing_stop=signal.get("trailing_stop"),
+                            trailing_offset=signal.get("trailing_offset")
+                        )
+
+                        in_position = True
+                        entry_price = live_price
+                        side = signal["side"]
+                        trailing_stop = signal.get("trailing_stop", 0.5)
+                        trailing_offset = signal.get("trailing_offset", 0.2)
+                        trailing_sl = entry_price - (trailing_stop + trailing_offset) if side == "BUY" else entry_price + (trailing_stop + trailing_offset)
+
+                except Exception as e:
+                    log_error(f"Erreur d’analyse ou exécution : {e}")
+
+        except Exception as e:
+            log_error(f"💥 Erreur critique dans la boucle principale : {e}")
+            traceback.print_exc()
+
+        time.sleep(1)
+
+if __name__ == "__main__":
+    run_bot()
